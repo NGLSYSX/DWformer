@@ -1,0 +1,218 @@
+# 统一多天气恢复训练配置
+# 支持雨/雪/雾三种天气退化的联合训练
+# 目标: 训练单一权重处理所有天气类型
+
+name: Unified_AllWeather_Enhanced_v2
+model_type: ImageCleanModel
+scale: 1
+num_gpu: 1  # 自动检测GPU数量
+manual_seed: 42
+
+# 分布式训练设置
+find_unused_parameters: true
+use_amp: true  # 混合精度训练
+
+# ========================================
+# 数据集配置
+# ========================================
+datasets:
+  train:
+    name: AllWeather_Train
+    type: Dataset_PairedImage
+    dataroot_gt: /home/liu/LIUYUHUI/snowdata/allweather/gt
+    dataroot_lq: /home/liu/LIUYUHUI/snowdata/allweather/lq
+    geometric_augs: true
+    filename_tmpl: '{}'
+    io_backend: { type: disk }
+    use_shuffle: true
+    num_worker_per_gpu: 2  # 降低数据加载线程数以节省内存
+    batch_size_per_gpu: 1  # 保持最小批次大小
+    gt_size: 120  # 略微降低到120
+    mini_batch_sizes: [1, 1]  # 两个阶段都保持安全的batch size
+    iters: [92000, 200000]
+    gt_sizes: [64, 80, 96, 112, 128, 160, 192, 224]  # 移除最大尺寸256
+    use_hflip: true
+    use_rot90: true
+    dataset_enlarge_ratio: 1
+    prefetch_mode: ~
+    pin_memory: true  # 启用内存固定，提升数据传输效率
+
+  val:
+    name: ValSet_Raindrop
+    type: Dataset_PairedImage
+    dataroot_gt: /home/liu/LIUYUHUI/snowdata/Raindrop/test_a/gt
+    dataroot_lq: /home/liu/LIUYUHUI/snowdata/Raindrop/test_a/lq
+    io_backend: { type: disk }
+    num_worker_per_gpu: 2
+    batch_size_per_gpu: 1
+    use_shuffle: false
+    pin_memory: false
+
+# ========================================
+# 网络架构: EnhancedRestormer (优化版)
+# ========================================
+network_g:
+  type: EnhancedRestormer
+  inp_channels: 3
+  out_channels: 3
+
+  # 网络容量配置（略微调整配置）
+  dim: 60  # 略微降低到60
+  num_blocks: [4, 6, 8, 8]  # 略微降低最后一层
+  num_refinement_blocks: 6  # 保持6
+  heads: [1, 2, 4, 8]  # 保持维度匹配
+  ffn_expansion_factor: 2.5  # 略微降低到2.5
+  bias: false
+  LayerNorm_type: WithBias
+  dual_pixel_task: false
+
+  # 核心特性：天气自适应（关键！）
+  use_weather_adaptive: true
+  num_weather_conditions: 4  # rain/snow/haze/clean
+
+  # RCP残差通道处理（对雨雪有效）
+  use_rcp: true
+
+  # 梯度检查点（启用以节省显存）
+  use_checkpoint: true
+
+  # 新增：ECA-Net注意力机制（高效通道注意力）
+  use_eca: true
+
+  # 新增：LPIPS和Focal Frequency Loss (仅用于Loss计算，不作为网络一部分)
+  use_lpips: false
+  use_focal_freq: false
+
+# ========================================
+# 预训练权重路径
+# ========================================
+path:
+  pretrain_network_g: ~
+  strict_load_g: false  # 设置为false以允许加载包含rcp_adapter的权重文件
+  resume_state: /home/liu/LIUYUHUI/Restormer-main1plus10/experiments/Unified_AllWeather_Enhanced_v2/training_states/500000.state
+
+# ========================================
+# 训练配置
+# ========================================
+train:
+  # 训练迭代设置
+  total_iter: 500000
+  warmup_iter: 15000
+
+  # 梯度裁剪（稳定训练）
+  use_grad_clip: true
+  grad_clip_norm: 1.0
+
+  # EMA平滑（提升泛化）
+  ema_decay: 0.999
+
+  # 学习率调度器（稳定优化版）
+  scheduler:
+    type: CosineAnnealingRestartCyclicLR
+    periods: [50000, 80000, 120000, 150000, 100000]  # 更长的周期，充分训练
+    restart_weights: [1, 0.95, 0.9, 0.8, 0.7]  # 更温和的衰减，避免训练不充分
+    eta_mins: [0.0002, 0.00015, 0.0001, 0.00008, 0.00005]  # 适中的最小学习率
+
+  # 数据增强（高性能版）
+  mixing_augs:
+    mixup: true
+    mixup_beta: 2.0  # 进一步增强MixUp强度，最大化泛化能力
+    use_identity: true
+    cutmix: true  # 添加CutMix增强
+    cutmix_alpha: 1.2  # 增强CutMix强度
+    cutmix_prob: 0.5  # 50%概率使用CutMix
+    mixup_prob: 0.8  # 80%概率使用MixUp
+
+  # 优化器配置（超稳定版）
+  optim_g:
+    type: AdamW
+    lr: !!float 1e-4  # 降低学习率确保超稳定训练
+    weight_decay: !!float 1e-4  # 提高权重衰减防止过拟合
+    betas: [0.9, 0.999]
+    eps: !!float 1e-8
+
+  # ========================================
+  # 显存监控和自动降级机制
+  # ========================================
+  memory_monitoring:
+    enable: true
+    max_memory_usage: 0.85  # 最大显存使用率85%
+    warning_threshold: 0.80  # 警告阈值80%
+    auto_downgrade: true  # 启用自动降级
+    downgrade_steps:
+      - reduce_batch_size: true
+      - reduce_window_size: true
+      - disable_fft: true
+      - force_cpu_validation: true
+
+  # ========================================
+  # 统一损失函数（优化版 - 针对Haze场景改进）
+  # ========================================
+  pixel_opt:
+    type: UnifiedWeatherLoss  # 新的统一损失
+    loss_weight: 1.0  # 降回1.0，避免过拟合
+    
+    # 损失函数配置 (针对Haze场景优化)
+    charbonnier_weight: 0.8      # 降低基础损失权重，避免过度约束
+    ssim_weight: 0.5             # 提高到0.5，增强结构相似性（关键for Haze）
+    edge_weight: 0.3             # 提高到0.3，增强边缘恢复（关键for Haze细节）
+    fcr_weight: 0.06             # 进一步降低，减少频率约束
+    color_weight: 0.05           # 降低颜色权重，避免颜色过拟合
+    low_freq_weight: 0.18        # 提高低频权重，有利于雾场景整体恢复
+    
+    # 高级损失权重 (大幅优化)
+    lpips_weight: 0.05           # 大幅降低LPIPS权重，避免过度平滑（关键改进）
+    focal_freq_weight: 0.08      # 适当提高频域损失，增强细节恢复
+    
+    use_lpips: true  # 启用LPIPS感知损失
+    use_focal_freq: true  # 启用Focal Frequency Loss
+
+# ========================================
+# 验证配置 - 平衡优化版
+# ========================================
+val:
+  window_size: 4  # 提高窗口大小，获得更准确的验证结果
+  val_freq: !!float 3e3  # 更频繁的验证，及时发现问题
+  save_img: false
+  save_img_freq: !!float 60000  # 更频繁保存验证图像
+  rgb2bgr: true
+  use_image: true
+  max_minibatch: 2  # 适当提高验证batch
+  force_cpu_validation: true  # 紧急：强制CPU验证避免OOM
+  clear_cache_before_val: true  # 验证前清理缓存
+  use_half_precision_val: false  # CPU验证时禁用半精度
+  force_gc_before_val: true  # 验证前强制垃圾回收
+  empty_cache_before_val: true  # 验证前清空CUDA缓存
+  
+  # 新增：更严格的显存管理
+  force_empty_cache_after_val: true  # 验证后清空缓存
+  validation_memory_limit: 0.3  # 验证时最大显存使用30% (进一步降低)
+  
+  # 紧急：跳过验证模式（临时解决方案）
+  skip_validation: true  # 暂时跳过验证避免OOM，训练稳定后可改为false
+
+  # 评估指标
+  metrics:
+    psnr_y:
+      type: calculate_psnr
+      crop_border: 4
+      test_y_channel: true
+    ssim:
+      type: calculate_ssim
+      crop_border: 4
+      test_y_channel: false
+
+# ========================================
+# 日志配置
+# ========================================
+logger:
+  print_freq: 500
+  save_checkpoint_freq: !!float 5000
+  use_tb_logger: true
+
+# ========================================
+# 分布式训练参数
+# ========================================
+dist_params:
+  backend: nccl
+  port: 29500
